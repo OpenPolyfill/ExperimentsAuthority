@@ -18,6 +18,9 @@ const { AddonInternal, XPIDatabase } = ChromeUtils.importESModule(
 const { AddonManager } = ChromeUtils.importESModule(
   "resource://gre/modules/AddonManager.sys.mjs"
 );
+const { AddonSettings } = ChromeUtils.importESModule(
+  "resource://gre/modules/addons/AddonSettings.sys.mjs"
+);
 
 const verifiedPackages = new Map();
 const verifiedRoots = new Map();
@@ -30,6 +33,25 @@ let policyGeneration = 0;
 function record(value) {
   return value !== null && typeof value === "object" &&
     !Array.isArray(value);
+}
+
+function manifestHasExperimentApis(manifest) {
+  return record(manifest?.experiment_apis) &&
+    Object.keys(manifest.experiment_apis).length > 0;
+}
+
+function shouldVerifyCustomCA(experimentApis) {
+  return XPIDatabase.mustSign("extension") ||
+    (experimentApis && !AddonSettings.EXPERIMENTS_ENABLED);
+}
+
+async function shouldVerifyInstalledCA(rootURI) {
+  if (XPIDatabase.mustSign("extension")) return true;
+  if (AddonSettings.EXPERIMENTS_ENABLED) return false;
+  const uri = typeof rootURI === "string" ? Services.io.newURI(rootURI) : rootURI;
+  const extension = new ExtensionData(uri);
+  await extension.initializeAddonTypeAndID();
+  return manifestHasExperimentApis(extension.rawManifest);
 }
 
 function validatePolicy(snapshot) {
@@ -154,7 +176,8 @@ function trustedPackage(id, rootURI) {
   }
   const key = verifiedRoots.get(root);
   const entry = key && verifiedPackages.get(key);
-  return entry?.generation === policyGeneration ? entry : null;
+  return entry?.generation === policyGeneration &&
+    shouldVerifyCustomCA(entry.hasExperimentApis) ? entry : null;
 }
 
 function isVerified(id, rootURI) {
@@ -348,8 +371,7 @@ async function verifyArchive(id, rootURI, keyring) {
     const extensionManifest = readZipBytes(zip, "manifest.json", 2 * 1024 * 1024);
     if (!extensionManifest) return false;
     const metadata = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(extensionManifest));
-    hasExperimentApis = record(metadata.experiment_apis) &&
-      Object.keys(metadata.experiment_apis).length > 0;
+    hasExperimentApis = manifestHasExperimentApis(metadata);
   } finally {
     zip.close();
   }
@@ -391,6 +413,9 @@ ExtensionData.constructAsync = async function (...args) {
   await policyReady;
   const generation = policyGeneration;
   const keyring = policy;
+  if (!shouldVerifyCustomCA(manifestHasExperimentApis(extension.rawManifest))) {
+    return extension;
+  }
   if (!Object.keys(keyring.keys).length) {
     return extension;
   }
@@ -513,7 +538,8 @@ async function reloadAddons(ids, reloadActive = new Set(), reverify = false) {
         if (root) verifiedRoots.set(root, null);
         const generation = policyGeneration;
         const keyring = policy;
-        if (Object.keys(keyring.keys).length) {
+        if (Object.keys(keyring.keys).length &&
+            await shouldVerifyInstalledCA(internal.rootURI)) {
           const verified = await verifyArchive(id, internal.rootURI, keyring);
           if (verified && generation === policyGeneration) {
             rememberVerified(id, internal.rootURI, verified, generation);
@@ -628,4 +654,17 @@ const policyObserver = {
   },
 };
 Services.obs.addObserver(policyObserver, POLICY_CHANGED_TOPIC);
+const signaturePrefsObserver = {
+  observe(_subject, topic) {
+    if (topic !== "nsPref:changed") return;
+    updateQueue = updateQueue.then(async () => {
+      const installed = await AddonManager.getAllAddons();
+      const ids = installed.filter(addon => addon.__AddonInternal__?.type === "extension")
+        .map(addon => addon.id);
+      await reloadAddons(ids, new Set(ids), true);
+    }).catch(error => console.error(`${TAG} Failed to apply signature preference change`, error));
+  },
+};
+Services.prefs.addObserver("xpinstall.signatures.required", signaturePrefsObserver);
+Services.prefs.addObserver("extensions.experiments.enabled", signaturePrefsObserver);
 console.info(`${TAG} Signed bridge active; IndexedDB policy`);
