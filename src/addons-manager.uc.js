@@ -111,6 +111,137 @@
     }
   }
 
+  function caSource(input) {
+    const value = input.trim();
+    const repository = /^([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(value);
+    if (repository) return { kind: "repo", owner: repository[1], repo: repository[2] };
+
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("Enter owner/repo, a GitHub repository URL, or an HTTPS CA certificate URL.");
+    }
+    if (url.protocol !== "https:" || url.username || url.password) {
+      throw new Error("CA sources must use HTTPS without embedded credentials.");
+    }
+
+    if (url.hostname === "github.com") {
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts.length < 2) throw new Error("Invalid GitHub repository URL.");
+      const [owner, originalRepo, operation] = parts;
+      if (!/^[A-Za-z0-9-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(originalRepo)) {
+        throw new Error("Invalid GitHub repository name.");
+      }
+      const repo = originalRepo.replace(/\.git$/, "");
+      if (operation === "blob" || operation === "raw") {
+        if (parts.length < 5) throw new Error("GitHub file URL must include a ref and file path.");
+        return {
+          kind: "file",
+          url: `https://raw.githubusercontent.com/${owner}/${repo}/${parts.slice(3).join("/")}`,
+          name: `${owner}/${repo}`,
+        };
+      }
+      if (operation === "releases" && parts[3] === "download" && parts.length >= 6) {
+        return { kind: "file", url: url.href, name: `${owner}/${repo}` };
+      }
+      if (!operation || operation === "tree") return { kind: "repo", owner, repo };
+      throw new Error("Use the repository root URL or a direct certificate file URL.");
+    }
+    return { kind: "file", url: url.href, name: url.hostname };
+  }
+
+  async function sourceText(url, limit = 128 * 1024, allow404 = false) {
+    const response = await fetch(url, { credentials: "omit", cache: "no-store" });
+    if (allow404 && response.status === 404) return null;
+    if (!response.ok) throw new Error(`Cannot fetch CA source (HTTP ${response.status}).`);
+    if (!response.url.startsWith("https://")) throw new Error("CA source redirected to an insecure URL.");
+    if (Number(response.headers.get("content-length")) > limit) {
+      throw new Error("CA source exceeds the size limit.");
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      const text = await response.text();
+      if (new TextEncoder().encode(text).length > limit) throw new Error("CA source exceeds the size limit.");
+      return text;
+    }
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        throw new Error("CA source exceeds the size limit.");
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  }
+
+  function certificatePath(path) {
+    return typeof path === "string" && path.length > 0 &&
+      !path.startsWith("/") && !path.includes("\\") && !path.includes("?") &&
+      !path.includes("#") && path.split("/").every(part => part && part !== "." && part !== "..");
+  }
+
+  async function resolveCA(input) {
+    const source = caSource(input);
+    let url = source.url;
+    let name = source.name;
+
+    if (source.kind === "repo") {
+      const { owner, repo } = source;
+      const info = JSON.parse(await sourceText(`https://api.github.com/repos/${owner}/${repo}`));
+      const branch = info.default_branch;
+      if (typeof branch !== "string" || !branch) throw new Error("GitHub did not report a default branch.");
+      const base = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/`;
+      const index = await sourceText(`${base}manifest.json`, 128 * 1024, true);
+      let path;
+      if (index !== null) {
+        const manifest = JSON.parse(index);
+        path = manifest?.signing?.ca_certificate;
+        if (path !== undefined && !certificatePath(path)) {
+          throw new Error("xpi-manifest declares an invalid CA certificate path.");
+        }
+      }
+      if (!path) {
+        const listing = await sourceText(
+          `https://api.github.com/repos/${owner}/${repo}/contents/certificates?ref=${encodeURIComponent(branch)}`,
+          128 * 1024, true
+        );
+        const files = listing === null ? [] : JSON.parse(listing);
+        const candidates = Array.isArray(files) ? files.filter(file =>
+          file.type === "file" && /\.(?:pem|crt|cer)$/i.test(file.name) && certificatePath(file.path)) : [];
+        if (candidates.length !== 1) {
+          throw new Error(candidates.length
+            ? "Multiple CA certificates found; use a direct certificate URL."
+            : "No CA certificate declared in manifest.json or found in certificates/.");
+        }
+        path = candidates[0].path;
+      }
+      url = `${base}${path.split("/").map(encodeURIComponent).join("/")}`;
+      name = `${owner}/${repo}`;
+    }
+
+    const pem = (await sourceText(url)).trim();
+    if (!validCertificate(pem)) throw new Error("The resolved file is not one PEM-encoded X.509 certificate.");
+    const encoded = pem.match(/-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----/)[1];
+    const der = Uint8Array.from(atob(encoded.replace(/\s/g, "")), char => char.charCodeAt(0));
+    const digest = await crypto.subtle.digest("SHA-256", der);
+    const fingerprint = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0"))
+      .join(":").toUpperCase();
+    return { pem, name, url, fingerprint };
+  }
+
   async function savePolicy(policy) {
     const transaction = db.transaction(["certificates", "privileges", "providers"], "readwrite");
     const certificates = transaction.objectStore("certificates");
@@ -359,12 +490,46 @@
     function keyDialog(previousName) {
       openDialog(previousName ? "Edit CA certificate" : "Add CA certificate", form => {
         const name = field("CA name", previousName || "");
+        const source = field("GitHub repository or CA certificate URL");
+        source.input.placeholder = "owner/repo or https://.../ca.pem";
         const value = field("CA certificate (PEM)", previousName ? policy.keys[previousName] : "", true);
-        form.append(name.wrapper, value.wrapper);
-        return { name: name.input, value: value.input };
-      }, ({ name, value }) => {
+        const result = node("moz-message-bar");
+        result.hidden = true;
+        const sourceActions = node("div", "experiments-authority-add-action");
+        let resolvedSource = "";
+        const resolve = button("Resolve CA", async event => {
+          event.preventDefault();
+          resolve.disabled = true;
+          result.hidden = true;
+          try {
+            const input = source.input.value.trim();
+            const certificate = await resolveCA(input);
+            value.input.value = certificate.pem;
+            if (!name.input.value.trim()) name.input.value = certificate.name;
+            resolvedSource = input;
+            result.type = "info";
+            result.message = `Resolved ${certificate.url}\nSHA-256: ${certificate.fingerprint}`;
+          } catch (error) {
+            resolvedSource = "";
+            result.type = "error";
+            result.message = error.message;
+          } finally {
+            resolve.disabled = false;
+            result.hidden = false;
+          }
+        });
+        source.input.addEventListener("input", () => { resolvedSource = ""; result.hidden = true; });
+        value.input.addEventListener("input", () => { resolvedSource = ""; result.hidden = true; });
+        sourceActions.append(resolve);
+        form.append(name.wrapper, source.wrapper, sourceActions, result, value.wrapper);
+        return { name: name.input, value: value.input, source: source.input,
+          isResolved: () => resolvedSource === source.input.value.trim() };
+      }, ({ name, value, source, isResolved }) => {
         const nextName = name.value.trim();
         const key = value.value.trim();
+        if (source.value.trim() && !isResolved()) {
+          throw new Error("Resolve the CA source before saving.");
+        }
         if (!nextName) throw new Error("Enter a key name.");
         if (nextName !== previousName && Object.hasOwn(policy.keys, nextName)) {
           throw new Error("A key with this name already exists.");

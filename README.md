@@ -11,7 +11,10 @@ Requires Firefox (or a compatible fork) and Sine 2.x.
 1. In Sine, install this repository as an unpublished mod using its GitHub URL.
 2. Enable `sine.allow-unsafe-js` in `about:config`.
 3. Restart Firefox and open **Add-ons and themes → Experiments**.
-4. Add a named PEM certificate under **Trusted certificate authorities**.
+4. Under **Trusted certificate authorities**, paste a named PEM certificate or
+   enter `owner/repo`, a GitHub repository URL, or a direct HTTPS certificate
+   URL. Select **Resolve CA**, review the certificate and SHA-256 fingerprint,
+   then select **Save** to trust it.
 
 Sine loads `src/authority.sys.mjs` as a background module and
 `src/addons-manager.uc.js` in `about:addons`, as declared in `theme.json`.
@@ -21,6 +24,9 @@ compatible userChrome.js loader.
 ## Features
 
 - **CA manager:** add, rename, edit, or remove user-trusted signing CAs.
+  Repository imports read the `signing.ca_certificate` path from the root
+  `manifest.json`, falling back to scanning `certificates/` for a single PEM
+  when no path is declared. Importing never auto-trusts subsequent repo changes.
 - **Experiment privileges:** trusted add-ons declaring `experiment_apis`
   receive privileged access by default, with per-add-on enable/disable toggles.
 - **Experiment API mapping:** map an API name to a provider add-on ID instead
