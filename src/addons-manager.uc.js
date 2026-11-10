@@ -111,6 +111,22 @@
     }
   }
 
+  function certificateDescription(pem) {
+    try {
+      const base64 = pem.match(/-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----/)[1]
+        .replace(/\s/g, "");
+      const certDB = Cc["@mozilla.org/security/x509certdb;1"].getService(Ci.nsIX509CertDB);
+      const cert = certDB.constructX509FromBase64(base64);
+      const subject = cert.commonName || cert.subjectName;
+      const issuer = cert.issuerCommonName || cert.issuerName;
+      const expires = cert.validity.notAfterLocalTime;
+      return `CN: ${subject} · Issuer: ${issuer} · Expires: ${expires}`;
+    } catch (error) {
+      console.warn("[Experiments Authority] Cannot inspect CA certificate", error);
+      return "Cannot read X.509 certificate details";
+    }
+  }
+
   function caSource(input) {
     const value = input.trim();
     const repository = /^([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(value);
@@ -368,7 +384,7 @@
       return fields;
     }
 
-    function openDialog(title, build, apply) {
+    function openDialog(title, build, apply, readOnly = false) {
       const dialog = node("dialog", "experiments-authority-dialog");
       dialog.setAttribute("aria-label", title);
       const titlebar = node("header", "experiments-authority-dialog-titlebar");
@@ -388,7 +404,7 @@
       error.hidden = true;
       form.append(error);
       const actions = node("moz-button-group", "experiments-authority-dialog-actions");
-      actions.append(button("Cancel", () => dialog.close()));
+      actions.append(button(readOnly ? "Close" : "Cancel", () => dialog.close()));
       let saving = false;
       const commit = async () => {
         if (saving) return;
@@ -406,11 +422,11 @@
           saving = false;
         }
       };
-      actions.append(button("Save", commit, true));
+      if (!readOnly) actions.append(button("Save", commit, true));
       form.append(actions);
       form.addEventListener("submit", event => {
         event.preventDefault();
-        commit();
+        if (!readOnly) commit();
       });
       dialog.append(form);
       dialog.addEventListener("close", () => dialog.remove(), { once: true });
@@ -542,9 +558,31 @@
       });
     }
 
+    function mozillaCADialog() {
+      openDialog("Mozilla CA", form => {
+        const name = field("CA name", "Mozilla");
+        const authority = field("Certificate authority", "Firefox built-in XPI signing trust");
+        for (const input of [name.input, authority.input]) {
+          input.readOnly = true;
+          input.setAttribute("readonly", "");
+        }
+        form.append(name.wrapper, authority.wrapper);
+      }, null, true);
+    }
+
     function populate(group, entries, type) {
       group.replaceChildren();
+      if (type === "key") {
+        const row = node("moz-box-item");
+        row.label = "Mozilla";
+        row.description = "Firefox built-in XPI signing trust";
+        const edit = iconButton("Edit Mozilla", "edit-outline", mozillaCADialog);
+        edit.slot = "actions";
+        row.append(edit);
+        group.append(row);
+      }
       if (!entries.length) {
+        if (type === "key") return;
         const row = node("moz-box-item", "experiments-authority-empty");
         row.label = "No entries configured.";
         group.append(row);
@@ -553,7 +591,7 @@
       for (const [name, value] of entries) {
         const row = node("moz-box-item");
         row.label = name;
-        row.description = type === "key" ? "X.509 CA certificate (PEM)" : value;
+        row.description = type === "key" ? certificateDescription(value) : value;
         const edit = iconButton(`Edit ${name}`, "edit-outline", () =>
           type === "key" ? keyDialog(name) : providerDialog(name));
         const remove = iconButton(`Remove ${name}`, "delete", () =>
