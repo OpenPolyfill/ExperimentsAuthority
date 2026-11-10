@@ -119,7 +119,7 @@
       const cert = certDB.constructX509FromBase64(base64);
       const subject = cert.commonName || cert.subjectName;
       const issuer = cert.issuerCommonName || cert.issuerName;
-      const expires = cert.validity.notAfterLocalTime;
+      const expires = cert.validity.notAfterLocalTime || "None";
       return `CN: ${subject} · Issuer: ${issuer} · Expires: ${expires}`;
     } catch (error) {
       console.warn("[Experiments Authority] Cannot inspect CA certificate", error);
