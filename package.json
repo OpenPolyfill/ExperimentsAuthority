@@ -1,0 +1,17 @@
+{
+  "name": "experiments-authority",
+  "private": true,
+  "version": "1.0.0",
+  "license": "MPL-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/vendor-entry.mjs --bundle --platform=browser --format=esm --target=firefox128 --outfile=vendor/pkijs.sys.mjs",
+    "check": "node --check src/authority.sys.mjs && node --check src/policy-db.mjs && node --check src/experiment-dependencies.mjs && node --check src/addons-manager.uc.js && node --check vendor/pkijs.sys.mjs"
+  },
+  "dependencies": {
+    "pkijs": "4.0.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
