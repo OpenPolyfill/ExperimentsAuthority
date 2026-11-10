@@ -404,10 +404,10 @@
       error.hidden = true;
       form.append(error);
       const actions = node("moz-button-group", "experiments-authority-dialog-actions");
-      actions.append(button(readOnly ? "Close" : "Cancel", () => dialog.close()));
+      actions.append(button("Cancel", () => dialog.close()));
       let saving = false;
       const commit = async () => {
-        if (saving) return;
+        if (readOnly || saving) return;
         try {
           saving = true;
           apply(controls);
@@ -422,7 +422,9 @@
           saving = false;
         }
       };
-      if (!readOnly) actions.append(button("Save", commit, true));
+      const save = button("Save", commit, true);
+      save.disabled = readOnly;
+      actions.append(save);
       form.append(actions);
       form.addEventListener("submit", event => {
         event.preventDefault();
@@ -503,12 +505,20 @@
       });
     }
 
-    function keyDialog(previousName) {
+    function keyDialog(previousName, readOnly = false) {
       openDialog(previousName ? "Edit CA certificate" : "Add CA certificate", form => {
         const name = field("CA name", previousName || "");
         const source = field("GitHub repository or CA certificate URL");
-        source.input.placeholder = "owner/repo or https://.../ca.pem";
-        const value = field("CA certificate (PEM)", previousName ? policy.keys[previousName] : "", true);
+        source.input.placeholder = readOnly ? "Managed by Firefox" : "owner/repo or https://.../ca.pem";
+        const value = field("CA certificate (PEM)",
+          readOnly ? "" : previousName ? policy.keys[previousName] : "", true);
+        if (readOnly) {
+          value.input.placeholder = "Built into Firefox; not exposed to JavaScript";
+          for (const input of [name.input, source.input, value.input]) {
+            input.readOnly = true;
+            input.setAttribute("readonly", "");
+          }
+        }
         const result = node("moz-message-bar");
         result.hidden = true;
         const sourceActions = node("div", "experiments-authority-add-action");
@@ -534,6 +544,7 @@
             result.hidden = false;
           }
         });
+        resolve.disabled = readOnly;
         source.input.addEventListener("input", () => { resolvedSource = ""; result.hidden = true; });
         value.input.addEventListener("input", () => { resolvedSource = ""; result.hidden = true; });
         sourceActions.append(resolve);
@@ -555,19 +566,7 @@
           [current === previousName ? nextName : current, current === previousName ? key : publicKey]);
         if (!previousName) entries.push([nextName, key]);
         policy.keys = Object.fromEntries(entries);
-      });
-    }
-
-    function mozillaCADialog() {
-      openDialog("Mozilla CA", form => {
-        const name = field("CA name", "Mozilla");
-        const authority = field("Certificate authority", "Firefox built-in XPI signing trust");
-        for (const input of [name.input, authority.input]) {
-          input.readOnly = true;
-          input.setAttribute("readonly", "");
-        }
-        form.append(name.wrapper, authority.wrapper);
-      }, null, true);
+      }, readOnly);
     }
 
     function populate(group, entries, type) {
@@ -576,9 +575,12 @@
         const row = node("moz-box-item");
         row.label = "Mozilla";
         row.description = "Firefox built-in XPI signing trust";
-        const edit = iconButton("Edit Mozilla", "edit-outline", mozillaCADialog);
+        const edit = iconButton("Edit Mozilla", "edit-outline", () => keyDialog("Mozilla", true));
+        const remove = iconButton("Remove Mozilla", "delete", () => {});
+        remove.disabled = true;
         edit.slot = "actions";
-        row.append(edit);
+        remove.slot = "actions";
+        row.append(edit, remove);
         group.append(row);
       }
       if (!entries.length) {
