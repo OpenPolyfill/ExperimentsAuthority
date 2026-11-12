@@ -25,6 +25,8 @@ const { AddonSettings } = ChromeUtils.importESModule(
 const verifiedPackages = new Map();
 const verifiedRoots = new Map();
 const verifiedIds = new Set();
+const verificationGenerations = new Map();
+let nextVerificationGeneration = 0;
 const nativeSignedStates = new WeakMap();
 const emptyPolicy = () => ({ keys: {}, addons: {}, providers: {} });
 let policy = emptyPolicy();
@@ -130,6 +132,9 @@ function clearVerifiedAddon(id) {
   for (const key of verifiedRoots.keys()) {
     if (key.startsWith(prefix)) verifiedRoots.delete(key);
   }
+  for (const key of verificationGenerations.keys()) {
+    if (key.startsWith(prefix)) verificationGenerations.delete(key);
+  }
   verifiedIds.delete(id);
 }
 
@@ -161,6 +166,44 @@ function hashArchive(rootURI) {
   }
 }
 
+function startVerification(id, rootURI) {
+  const root = rootKey(id, rootURI);
+  const token = ++nextVerificationGeneration;
+  if (root) {
+    verificationGenerations.set(root, token);
+    const previousKey = verifiedRoots.get(root);
+    if (previousKey) {
+      try {
+        if (previousKey !== packageKey(id, hashArchive(rootURI), policyGeneration)) {
+          verifiedRoots.delete(root);
+        }
+      } catch {
+        verifiedRoots.delete(root);
+      }
+    } else {
+      verifiedRoots.delete(root);
+    }
+  }
+  return { id, rootURI, root, token, generation: policyGeneration, keyring: policy };
+}
+
+function finishVerification(operation, verified) {
+  const { id, rootURI, root, token, generation } = operation;
+  if (generation !== policyGeneration ||
+      (root && verificationGenerations.get(root) !== token)) {
+    return false;
+  }
+  if (root) verificationGenerations.delete(root);
+  if (verified) {
+    rememberVerified(id, rootURI, verified, generation);
+  } else if (root) {
+    const previousKey = verifiedRoots.get(root);
+    if (previousKey) verifiedPackages.delete(previousKey);
+    verifiedRoots.delete(root);
+  }
+  return true;
+}
+
 function trustedPackage(id, rootURI) {
   const root = rootKey(id, rootURI);
   if (!root) return null;
@@ -170,8 +213,6 @@ function trustedPackage(id, rootURI) {
       const key = packageKey(id, hashArchive(rootURI), policyGeneration);
       verifiedRoots.set(root, verifiedPackages.has(key) ? key : null);
     } catch {
-      // Unpacked or unreadable root: deny until the next lifecycle verification.
-      verifiedRoots.set(root, null);
     }
   }
   const key = verifiedRoots.get(root);
@@ -408,27 +449,23 @@ ExtensionData.constructAsync = async function (...args) {
     return extension;
   }
 
-  const root = rootKey(extension.id, extension.rootURI);
-  if (root) verifiedRoots.set(root, null);
   await policyReady;
-  const generation = policyGeneration;
-  const keyring = policy;
-  if (!shouldVerifyCustomCA(manifestHasExperimentApis(extension.rawManifest))) {
+  if (!shouldVerifyCustomCA(manifestHasExperimentApis(extension.rawManifest)) ||
+      !Object.keys(policy.keys).length) {
     return extension;
   }
-  if (!Object.keys(keyring.keys).length) {
-    return extension;
-  }
+  const operation = startVerification(extension.id, extension.rootURI);
   try {
-    const verified = await verifyArchive(extension.id, extension.rootURI, keyring);
-    if (verified && generation === policyGeneration) {
-      rememberVerified(extension.id, extension.rootURI, verified, generation);
-      extension.isPrivileged = verified.hasExperimentApis && keyring.addons[extension.id] !== false;
+    const verified = await verifyArchive(extension.id, extension.rootURI, operation.keyring);
+    if (!finishVerification(operation, verified)) return extension;
+    if (verified) {
+      extension.isPrivileged = verified.hasExperimentApis && policy.addons[extension.id] !== false;
       console.info(`${TAG} Verified signer for ${extension.id}; privileged: ${extension.isPrivileged}`);
     } else {
       console.warn(`${TAG} Signature not trusted for ${extension.id}`);
     }
   } catch (error) {
+    finishVerification(operation, false);
     console.error(`${TAG} Verification failed for ${extension.id}`, error);
   }
   return extension;
@@ -534,17 +571,18 @@ async function reloadAddons(ids, reloadActive = new Set(), reverify = false) {
       }
       bindSignedState(internal);
       if (reverify) {
-        const root = rootKey(id, internal.rootURI);
-        if (root) verifiedRoots.set(root, null);
-        const generation = policyGeneration;
-        const keyring = policy;
-        if (Object.keys(keyring.keys).length &&
-            await shouldVerifyInstalledCA(internal.rootURI)) {
-          const verified = await verifyArchive(id, internal.rootURI, keyring);
-          if (verified && generation === policyGeneration) {
-            rememberVerified(id, internal.rootURI, verified, generation);
+        const operation = startVerification(id, internal.rootURI);
+        let verified = false;
+        try {
+          if (Object.keys(operation.keyring.keys).length &&
+              await shouldVerifyInstalledCA(internal.rootURI)) {
+            verified = await verifyArchive(id, internal.rootURI, operation.keyring);
           }
+        } catch (error) {
+          finishVerification(operation, false);
+          throw error;
         }
+        if (!finishVerification(operation, verified)) continue;
       }
       const wasActive = addon.isActive;
       await XPIDatabase.updateAddonDisabledState(internal);
@@ -617,6 +655,7 @@ const policyObserver = {
         verifiedPackages.clear();
         verifiedRoots.clear();
         verifiedIds.clear();
+        verificationGenerations.clear();
       }
       policy = next;
       const reloadActive = new Set();
