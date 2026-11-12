@@ -143,13 +143,24 @@ function rememberVerified(id, rootURI, verified, generation) {
   verifiedPackages.set(key, { generation, hasExperimentApis: verified.hasExperimentApis });
   verifiedIds.add(id);
   const root = rootKey(id, rootURI);
-  if (root) verifiedRoots.set(root, key);
+  if (root) {
+    try {
+      verifiedRoots.set(root, { key, stamp: archiveStamp(rootURI) });
+    } catch {
+      verifiedRoots.delete(root);
+    }
+  }
 }
 
 function archiveFile(rootURI) {
   const root = typeof rootURI === "string" ? Services.io.newURI(rootURI) : rootURI;
   return root?.QueryInterface(Ci.nsIJARURI)
     .JARFile.QueryInterface(Ci.nsIFileURL).file;
+}
+
+function archiveStamp(rootURI) {
+  const file = archiveFile(rootURI);
+  return `${file.fileSize}\u0000${file.lastModifiedTime}`;
 }
 
 function hashArchive(rootURI) {
@@ -171,17 +182,16 @@ function startVerification(id, rootURI) {
   const token = ++nextVerificationGeneration;
   if (root) {
     verificationGenerations.set(root, token);
-    const previousKey = verifiedRoots.get(root);
-    if (previousKey) {
+    const previous = verifiedRoots.get(root);
+    if (previous) {
       try {
-        if (previousKey !== packageKey(id, hashArchive(rootURI), policyGeneration)) {
+        if (previous.stamp !== archiveStamp(rootURI) ||
+            previous.key !== packageKey(id, hashArchive(rootURI), policyGeneration)) {
           verifiedRoots.delete(root);
         }
       } catch {
         verifiedRoots.delete(root);
       }
-    } else {
-      verifiedRoots.delete(root);
     }
   }
   return { id, rootURI, root, token, generation: policyGeneration, keyring: policy };
@@ -197,8 +207,8 @@ function finishVerification(operation, verified) {
   if (verified) {
     rememberVerified(id, rootURI, verified, generation);
   } else if (root) {
-    const previousKey = verifiedRoots.get(root);
-    if (previousKey) verifiedPackages.delete(previousKey);
+    const previous = verifiedRoots.get(root);
+    if (previous) verifiedPackages.delete(previous.key);
     verifiedRoots.delete(root);
   }
   return true;
@@ -207,16 +217,27 @@ function finishVerification(operation, verified) {
 function trustedPackage(id, rootURI) {
   const root = rootKey(id, rootURI);
   if (!root) return null;
-  if (!verifiedRoots.has(root)) {
-    if (!verifiedIds.has(id)) return null;
+  if (!verifiedIds.has(id)) return null;
+  let stamp;
+  try {
+    stamp = archiveStamp(rootURI);
+  } catch {
+    verifiedRoots.delete(root);
+    return null;
+  }
+  let cached = verifiedRoots.get(root);
+  if (!cached || cached.stamp !== stamp) {
+    verifiedRoots.delete(root);
     try {
       const key = packageKey(id, hashArchive(rootURI), policyGeneration);
-      verifiedRoots.set(root, verifiedPackages.has(key) ? key : null);
+      if (archiveStamp(rootURI) !== stamp || !verifiedPackages.has(key)) return null;
+      cached = { key, stamp };
+      verifiedRoots.set(root, cached);
     } catch {
+      return null;
     }
   }
-  const key = verifiedRoots.get(root);
-  const entry = key && verifiedPackages.get(key);
+  const entry = verifiedPackages.get(cached.key);
   return entry?.generation === policyGeneration &&
     shouldVerifyCustomCA(entry.hasExperimentApis) ? entry : null;
 }
